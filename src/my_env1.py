@@ -4,6 +4,8 @@ from random import randrange, seed
 from typing import Any, Dict, List, Optional, Tuple, cast, Union
 from dataclasses import dataclass
 from gym import spaces
+from stable_baselines3 import DDPG, PPO, SAC, TD3, A2C
+from stable_baselines3.common.noise import NormalActionNoise
 
 import matplotlib.pyplot as plt
 import gym
@@ -71,7 +73,7 @@ class State:
         )
     
     def get_max_state(self):
-        return np.array([math.inf, math.inf, math.inf, math.inf, math.inf, math.inf, math.inf, math.inf])
+        return np.array([math.inf, math.inf, math.inf, math.inf, 500,1670, math.inf, math.inf])
     
     def get_min_state(self):
         return np.array([0, 0, 0, 0, 0, 0, 0, 0])
@@ -288,20 +290,16 @@ class MicroGrid:
         p = self.solar_panel.get_production(time)
         w = self.wind_turbine.get_production(time)
         c = self.load.get_consumption(time)
-        punish = (abs(action[0]) - abs(b))**2 + (abs(action[1]) - abs(h))**2
-        punish = math.sqrt(punish)
         energe_shotage = c - p - w
         prize = 0
-        if energe_shotage+b+h<=0:
-            prize = -b-h
-        elif p+w-c-b-h<=0:
+        if b + h > 0 and p + w > c:
             prize = b + h
 
         import_from_grid = c + b + h - p - w
         import_from_grid = max(import_from_grid, 0)
         price = self.spot_market.get_price(time)
         self.cost = import_from_grid * price
-        self.reward = -self.cost + price * prize
+        self.reward = price * prize
         self.culmulative_reward += self.reward
         self.culmulative_cost += self.cost
         self.state.update(np.array([c, p, w, price, self.baterry.the_charge, self.hydrogen.the_charge, import_from_grid, energe_shotage]))
@@ -346,7 +344,7 @@ class WorkEnv(gym.Env):
         self.microgrid.action.clip()
         actual_action = self.microgrid.take_action()
         state = self.microgrid.state.into_array()
-        reward = self.microgrid.reward
+        reward = - self.microgrid.cost
         done = False
         info = {
             "cost": self.microgrid.cost,
@@ -390,7 +388,7 @@ class Plotter:
             "spot_market_price": info["state"][3],
             "battery_storage": info["state"][4],
             "hydrogen_storage": info["state"][5],
-            "energy_strorage": info["state"][4] + info["state"][5],
+            "energy_storage": info["state"][4] + info["state"][5],
             "grid_import": info["state"][6],
             "energy_shortage": info["state"][7],
         })
@@ -401,14 +399,23 @@ class Plotter:
             "actual_hydrogen": info["actual_action"][1],
         })
 
-    def plot(self):
+    def plot(self,name=""):
         state = pd.DataFrame(self.state, index=self.time)
         action = pd.DataFrame(self.action, index=self.time)
         cost = pd.DataFrame(self.cost, index=self.time)
-        state.plot(subplots=True,title="State")
-        action.plot(subplots=True,title="Action")
-        cost.plot(subplots=True,title="Cost")
-        plt.show()
+        state.plot(subplots=True,title="State-{}".format(name))
+        plt.savefig("state-{}.png".format(name),dpi=300)
+        action.plot(subplots=True,title="Action-{}".format(name))
+        plt.savefig("action-{}.png".format(name),dpi=300)
+        cost.plot(subplots=True,title="Cost-{}".format(name))
+        plt.savefig("cost-{}.png".format(name),dpi=300)
+        #plt.show()
+
+    def reset(self):
+        self.time = []
+        self.cost = []
+        self.state = []
+        self.action = []
 
 class TestAlgo:
     def __init__(self, model, env,potters=Plotter()):
@@ -417,8 +424,11 @@ class TestAlgo:
         self.plotter = potters
         self.cost = 0
         self.reward = 0
+        self.time_table = []
+        self.costs = []
+        self.rewards = []
 
-    def test(self):
+    def test(self,name=""):
         state = self.env.reset()
         done = False
         list1 = []
@@ -427,62 +437,239 @@ class TestAlgo:
             state, reward, done, info = self.env.step(action)
             self.plotter.update(info)
         
-        self.plotter.plot()
+        self.plotter.plot(name)
         self.cost = info["culmulative_cost"]
         self.reward = info["culmulative_reward"]
+
+    def test_no_plot(self,time=None):
+        state = self.env.reset(time)
+        done = False
+        while not done:
+            action, _states = self.model.predict(state)
+            state, reward, done, info = self.env.step(action)
+        
+        cost = info["culmulative_cost"]
+        reward = info["culmulative_reward"]
+
+        self.cost += cost
+        self.reward += reward
+
+    def test_multiple(self):
+        for time in self.time_table:
+            self.test_no_plot(time)
+            self.costs.append(self.cost)
+            self.rewards.append(self.reward)
+            self.cost = 0
+            self.reward = 0
     
+    def init_time_table(self,k=6):
+        time_table = self.env.microgrid.clock.time_table
+        t = []
+        for i in range(k):
+            t.append(time_table[i*24])
+        self.time_table = t
+    
+    def reset(self):
+        self.cost = 0
+        self.reward = 0
+        self.costs = []
+        self.rewards = []
+        self.plotter.reset()
+
     def print_cost(self):
         print(self.cost)
         print(self.reward)
 
-def test_clock():
-    data = Data.load_data("train")
-    clock = Clock(data.get_time())
-    print(clock.current_time)
 
-def test_env():
+class RandomAgent:
+    def __init__(self,action_space):
+        self.action_space = action_space
+
+    def predict(self, state):
+        return self.action_space.sample(), None
+    
+class SimpleAgent:
+    def __init__(self, action_space):
+        self.action_space = action_space
+
+    def predict(self, state):
+        action = np.array([0,0], dtype=np.float64)
+        if state[7] > 20:
+            action[0] = -10
+            action[1] = -10
+        else:
+            action[0] = 10
+            action[1] = 10
+        return action, None
+    
+class ConstantAgent:
+    def __init__(self, action_space):
+        self.action_space = action_space
+
+    def predict(self, state):
+        action = np.array([0,0], dtype=np.float64)
+        return action, None
+        
+def test_multi_model():
+    data = Data.load_data("test")
+    env = WorkEnv(data)
+    model0 = ConstantAgent(env.action_space)
+    model1 = SimpleAgent(env.action_space)
+    model2 = RandomAgent(env.action_space)
+    model3 = DDPG.load("ddpg")
+    model4 = A2C.load("a2c")
+    model5 = PPO.load("ppo")
+    model6 = SAC.load("sac")
+
+    test = TestAlgo(model0, env)
+    test.init_time_table()
+    test.test_multiple()
+    c0 = test.costs
+    r0 = test.rewards
+    test.reset()
+    
+    test.model = model1
+    test.test_multiple()
+    c1 = test.costs
+    r1 = test.rewards
+    test.reset()
+
+    test.model = model2
+    test.test_multiple()
+    c2 = test.costs
+    r2 = test.rewards
+    test.reset()
+
+    test.model = model3
+    test.test_multiple()
+    c3 = test.costs
+    r3 = test.rewards
+    test.reset()
+
+    test.model = model4
+    test.test_multiple()
+    c4 = test.costs
+    r4 = test.rewards
+    test.reset()
+
+    test.model = model5
+    test.test_multiple()
+    c5 = test.costs
+    r5 = test.rewards
+    test.reset()
+
+    test.model = model6
+    test.test_multiple()
+    c6 = test.costs
+    r6 = test.rewards
+    test.reset()
+
+    df = pd.DataFrame({
+        "constant": c0,
+        "simple": c1,
+        "random": c2,
+        "ddpg": c3,
+        "a2c": c4,
+        "ppo": c5,
+        "sac": c6,
+    })
+    df.plot()
+    plt.savefig("cost.png",dpi=300)
+    df.to_csv("cost.csv")
+    df = df.describe()
+    df.to_csv("cost_describe.csv")
+
+    df = pd.DataFrame({
+        "constant": r0,
+        "simple": r1,
+        "random": r2,
+        "ddpg": r3,
+        "a2c": r4,
+        "ppo": r5,
+        "sac": r6,
+    })
+    df.plot()
+    plt.savefig("reward.png",dpi=300)
+    df.to_csv("reward.csv")
+    df = df.describe()
+    df.to_csv("reward_describe.csv")
+        
+def plot_cost():
+    df = pd.read_csv("cost.csv")
+    df.plot()
+    plt.show()
+
+
+def train_model():
     data = Data.load_data("train")
     env = WorkEnv(data)
-    plotter = Plotter()
-    state = env.reset()
-    done = False
-    while not done:
-        b = random.randint(-100,100)
-        h = random.randint(-100,100)
-        action = np.array([b, h], dtype=np.float64)
-        state, reward, done, info = env.step(action)
-        plotter.update(info)
-    plotter.plot()
-        
-def test_action():
-    action = Action()
 
-    c = np.array([-83,63], dtype=np.float64)
-    action.update(c)
-    action.clip()
-    print(action.into_array())
+    n_actions = env.action_space.shape[-1]
+    action_noise = NormalActionNoise(mean=np.zeros(n_actions), sigma=100 * np.ones(n_actions))
 
-    battery = Battery()
-    b = battery.take_action(c)
-    print(b)
+    model = DDPG("MlpPolicy", env, action_noise=action_noise, verbose=1)
+    model.learn(total_timesteps=20000)
+    model.save("ddpg")
 
-    hydrogen = Hydrogen()
-    h = hydrogen.take_action(c)
-    print(h)
+    model = A2C("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=20000)
+    model.save("a2c")
 
-    a = np.array([80, 93], dtype=np.float64)
-    action.update(a)
-    action.clip()
-    print(action.into_array())
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=20000)
+    model.save("ppo")
 
-    b = battery.take_action(a)
-    print(b)
+    model = SAC("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=20000)
+    model.save("sac")
 
-    h = hydrogen.take_action(a)
-    print(h)
+def test_model(i):
+    data = Data.load_data("test")
+    env = WorkEnv(data)
+    model = DDPG.load("ddpg")
+    test = TestAlgo(model, env)
+    test.test("ddpg-{}".format(i))
+    test.print_cost()
+
+
+    model = A2C.load("a2c")
+    test.model = model
+    test.reset()
+    test.test("a2c-{}".format(i))
+    test.print_cost()
+
+    model = PPO.load("ppo")
+    test.model = model
+    test.reset()
+    test.test("ppo-{}".format(i))
+    test.print_cost()
+
+    model = SAC.load("sac")
+    test.model = model
+    test.reset()
+    test.test("sac-{}".format(i))
+    test.print_cost()
+
+    model = RandomAgent(env.action_space)
+    test.model = model
+    test.reset()
+    test.test("random-{}".format(i))
+    test.print_cost()
+
+    model = SimpleAgent(env.action_space)
+    test.model = model
+    test.reset()
+    test.test("simple-{}".format(i))
+    test.print_cost()
+
+    model = ConstantAgent(env.action_space)
+    test.model = model
+    test.reset()
+    test.test("constant-{}".format(i))
+    test.print_cost()
 
 if __name__ == "__main__":
-    test_env()
-    test_action()
-
+    train_model()
+    test_multi_model()
+    test_model(1)
 
